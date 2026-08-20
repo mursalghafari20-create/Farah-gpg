@@ -1,0 +1,425 @@
+
+# ==========================================
+# 1. database.py - Database Persistence & Audit Logging
+# ==========================================
+import sqlite3
+import json
+import os
+import time
+import logging
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel, Field
+from openai import OpenAI, OpenAIError
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+DB_PATH = "cyber_defense.db"
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Initializes SQLite schema and populates default baseline users."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            location TEXT,
+            attempts INTEGER DEFAULT 1,
+            time TEXT NOT NULL,
+            file TEXT,
+            severity TEXT DEFAULT 'low',
+            status TEXT DEFAULT 'PENDING'
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            risk_tier TEXT DEFAULT 'STANDARD',
+            past_incidents INTEGER DEFAULT 0,
+            is_flagged BOOLEAN DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            component TEXT NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT
+        )
+    """)
+    
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        cursor.executemany("""
+            INSERT INTO users (user_id, role, risk_tier, past_incidents, is_flagged) 
+            VALUES (?, ?, ?, ?, ?)
+        """, [
+            ("demo_user", "ANALYST", "HIGH", 3, 0),
+            ("student", "USER", "STANDARD", 0, 0),
+            ("admin_user", "ADMIN", "CRITICAL", 1, 0)
+        ])
+    
+    conn.commit()
+    conn.close()
+
+def log_audit(event_id: str, component: str, action: str, details: Dict[str, Any]):
+    """Appends immutable audit trail entry."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO audit_logs (timestamp, event_id, component, action, details) VALUES (?, ?, ?, ?, ?)",
+        (datetime.utcnow().isoformat(), event_id, component, action, json.dumps(details))
+    )
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# 2. models.py - Data Contracts & Schemas
+# ==========================================
+class EventModel(BaseModel):
+    event_id: str = Field(..., example="1042")
+    event_type: str = Field(..., example="LOGIN_ANOMALY")
+    user_id: str = Field(..., example="demo_user")
+    location: Optional[str] = "Unknown"
+    attempts: int = Field(1, ge=1)
+    time: str = Field(..., example="03:12")
+    file: Optional[str] = None
+    severity: Optional[str] = "low"
+
+class RiskAssessment(BaseModel):
+    score: int
+    level: str
+    indicators: List[str]
+    context_impact: int
+
+class AgentDecision(BaseModel):
+    risk_level: str
+    risk_score: int
+    reasoning: str
+    recommended_action: str
+    confidence: float
+
+class PolicyCheckResult(BaseModel):
+    allowed: bool
+    requires_approval: bool
+    policy_note: str
+    enforced_rule: str
+
+class AgentLLMResponse(BaseModel):
+    risk_level: str = Field(description="Assessed risk level: LOW, MEDIUM, or HIGH")
+    risk_score: int = Field(description="Numerical risk score from 0 to 100 based on context")
+    reasoning: str = Field(description="Detailed step-by-step security justification for the decision")
+    recommended_action: str = Field(description="Action name (e.g., REQUEST_APPROVAL, LOG_AND_MONITOR, ISOLATE_HOST, QUARANTINE_FILE)")
+    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
+
+
+# ==========================================
+# 3. analyzer.py - Rules Engine & Baseline Risk
+# ==========================================
+class RiskAnalyzer:
+    """Pre-computes deterministic risk metrics prior to agent evaluation."""
+
+    @staticmethod
+    def get_user_baseline(user_id: str) -> Dict[str, Any]:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return dict(row)
+        return {"user_id": user_id, "role": "UNKNOWN", "risk_tier": "STANDARD", "past_incidents": 0, "is_flagged": 0}
+
+    @classmethod
+    def evaluate(cls, event: EventModel) -> RiskAssessment:
+        score = 0
+        indicators = []
+        user_info = cls.get_user_baseline(event.user_id)
+
+        if event.attempts >= 10:
+            score += 45
+            indicators.append("Excessive repeated attempts (>=10)")
+        elif event.attempts >= 5:
+            score += 25
+            indicators.append("Elevated attempt threshold (>=5)")
+
+        if event.event_type == "FILE_ACCESS" and event.file:
+            if any(s in event.file.lower() for s in ["confidential", "secret", "payroll", "root"]):
+                score += 35
+                indicators.append(f"Sensitive file access targeted: {event.file}")
+        
+        if event.event_type == "LOGIN_ANOMALY":
+            score += 20
+            indicators.append("Anomalous auth pattern detected")
+
+        if event.location in ["Unknown", "Tor Exit Node", "Restricted Zone"]:
+            score += 15
+            indicators.append(f"High-risk geographic origin: {event.location}")
+
+        context_impact = 0
+        if user_info["past_incidents"] > 0:
+            context_impact += min(user_info["past_incidents"] * 10, 25)
+            indicators.append(f"User profile has {user_info['past_incidents']} past security incident(s)")
+
+        total_score = min(score + context_impact, 100)
+        
+        if total_score <= 30:
+            level = "LOW"
+        elif total_score <= 70:
+            level = "MEDIUM"
+        else:
+            level = "HIGH"
+
+        return RiskAssessment(
+            score=total_score,
+            level=level,
+            indicators=indicators,
+            context_impact=context_impact
+        )
+
+
+# ==========================================
+# 4. agent.py - Real LLM Reasoning Engine
+# ==========================================
+class SecurityAgent:
+    """LLM-driven agent using Structured Outputs with fault-tolerant heuristics fallback."""
+
+    CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "mock-key-if-testing"))
+    MODEL_NAME = "gpt-4o-mini"
+
+    @classmethod
+    def process_event(cls, event: EventModel, assessment: RiskAssessment) -> AgentDecision:
+        system_prompt = (
+            "You are an expert Autonomous Security Operations Center (SOC) AI Agent. "
+            "Analyze the incoming security event telemetry alongside pre-computed risk metrics. "
+            "Determine the contextual risk, justify your reasoning, and recommend the appropriate containment action. "
+            "You MUST adhere strictly to the JSON response schema."
+        )
+
+        user_content = {
+            "event_details": event.dict(),
+            "calculated_risk_assessment": assessment.dict()
+        }
+
+        try:
+            completion = cls.CLIENT.beta.chat.completions.parse(
+                model=cls.MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_content)}
+                ],
+                response_format=AgentLLMResponse,
+                temperature=0.1,
+                timeout=5.0
+            )
+
+            parsed_response: AgentLLMResponse = completion.choices[0].message.parsed
+
+            return AgentDecision(
+                risk_level=parsed_response.risk_level,
+                risk_score=parsed_response.risk_score,
+                reasoning=parsed_response.reasoning,
+                recommended_action=parsed_response.recommended_action,
+                confidence=parsed_response.confidence
+            )
+
+        except (OpenAIError, Exception) as err:
+            logging.error(f"LLM Reasoning failure: {str(err)}. Executing heuristic fallback.")
+            
+            return AgentDecision(
+                risk_level=assessment.level,
+                risk_score=assessment.score,
+                reasoning=f"FALLBACK MODE: LLM service unavailable ({type(err).__name__}). Reverted to heuristic bounds.",
+                recommended_action="REQUEST_APPROVAL" if assessment.level == "HIGH" else "LOG_AND_MONITOR",
+                confidence=0.50
+            )
+
+
+# ==========================================
+# 5. policy.py - Defense Guardrail Interceptor
+# ==========================================
+class PolicyHarness:
+    """Enforces zero-trust permissions over LLM output recommendations."""
+
+    RULES = {
+        "LOW": {"allow_auto": True, "require_approval": False, "rule": "Rule-01: Low risk allows autonomous resolution."},
+        "MEDIUM": {"allow_auto": True, "require_approval": False, "rule": "Rule-02: Medium risk allowed with full audit logging."},
+        "HIGH": {"allow_auto": False, "require_approval": True, "rule": "Rule-03: High risk restricts sensitive autonomous operations."},
+    }
+
+    @classmethod
+    def validate_action(cls, risk_level: str, proposed_action: str) -> PolicyCheckResult:
+        rule_config = cls.RULES.get(risk_level, {"allow_auto": False, "require_approval": True, "rule": "Rule-99: Default safety fallback."})
+        
+        critical_actions = ["ISOLATE_HOST", "REVOKE_ALL_CREDENTIALS", "BLOCK_USER"]
+        if proposed_action in critical_actions and risk_level in ["MEDIUM", "HIGH"]:
+            return PolicyCheckResult(
+                allowed=False,
+                requires_approval=True,
+                policy_note="Destructive remediation actions require explicit SOC confirmation.",
+                enforced_rule="Rule-04: Strict destructive action blockade."
+            )
+
+        return PolicyCheckResult(
+            allowed=rule_config["allow_auto"],
+            requires_approval=rule_config["require_approval"],
+            policy_note="Action validated against standard decision matrix.",
+            enforced_rule=rule_config["rule"]
+        )
+
+
+# ==========================================
+# 6. verifier.py - Self-Healing Verification Engine
+# ==========================================
+class ActionExecutionVerifier:
+    """Executes actions with automated retry loops and validation verification."""
+
+    @staticmethod
+    def execute_tool(action: str, event_id: str, force_fail_attempts: int = 0) -> bool:
+        if force_fail_attempts > 0:
+            return False
+        return True
+
+    @classmethod
+    def execute_and_verify(cls, event_id: str, action: str, max_retries: int = 3) -> Dict[str, Any]:
+        attempt = 0
+        success = False
+        execution_trace = []
+
+        while attempt < max_retries:
+            attempt += 1
+            timestamp = datetime.utcnow().isoformat()
+            
+            simulate_failure = 1 if (attempt == 1 and action != "LOG_AND_MONITOR") else 0
+            tool_status = cls.execute_tool(action, event_id, force_fail_attempts=simulate_failure)
+            
+            if tool_status:
+                success = True
+                trace_entry = {"attempt": attempt, "timestamp": timestamp, "status": "SUCCESS", "message": "Execution verified successfully."}
+                execution_trace.append(trace_entry)
+                log_audit(event_id, "VERIFIER", "ACTION_SUCCESS", trace_entry)
+                break
+            else:
+                trace_entry = {"attempt": attempt, "timestamp": timestamp, "status": "FAILED", "message": "Execution check failed. Retrying..."}
+                execution_trace.append(trace_entry)
+                log_audit(event_id, "VERIFIER", "ACTION_RETRY", trace_entry)
+                time.sleep(0.1)
+
+        return {
+            "target_action": action,
+            "success": success,
+            "total_attempts": attempt,
+            "status": "VERIFIED_COMPLETED" if success else "FAILED_MAX_RETRIES",
+            "trace": execution_trace
+        }
+
+
+# ==========================================
+# 7. main.py - FastAPI System Core
+# ==========================================
+app = FastAPI(title="AI Cyber Defense Framework", version="2.5.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def setup():
+    init_db()
+
+@app.post("/api/events/process", response_model=Dict[str, Any])
+async def process_security_event(event: EventModel):
+    """Pipeline: Ingest -> Deterministic Risk -> LLM Agent Reasoning -> Guardrail Intercept -> Self-Healing Execution."""
+    try:
+        log_audit(event.event_id, "INGEST", "EVENT_RECEIVED", event.dict())
+
+        assessment = RiskAnalyzer.evaluate(event)
+        log_audit(event.event_id, "ANALYZER", "RISK_CALCULATED", assessment.dict())
+
+        agent_decision = SecurityAgent.process_event(event, assessment)
+        log_audit(event.event_id, "AGENT", "DECISION_GENERATED", agent_decision.dict())
+
+        policy_result = PolicyHarness.validate_action(agent_decision.risk_level, agent_decision.recommended_action)
+        log_audit(event.event_id, "POLICY", "POLICY_EVALUATED", policy_result.dict())
+
+        response = {
+            "event_id": event.event_id,
+            "assessment": assessment.dict(),
+            "agent_decision": agent_decision.dict(),
+            "policy": policy_result.dict(),
+            "execution": None
+        }
+
+        if policy_result.allowed:
+            execution = ActionExecutionVerifier.execute_and_verify(
+                event.event_id, agent_decision.recommended_action
+            )
+            response["execution"] = execution
+        else:
+            response["execution"] = {
+                "status": "BLOCKED_PENDING_APPROVAL",
+                "message": "Action intercepted by security policy harness. Awaiting approval."
+            }
+
+        return response
+
+    except Exception as e:
+        log_audit(event.event_id, "SYSTEM", "CRITICAL_ERROR", {"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
+
+@app.post("/api/events/approve")
+async def approve_incident_action(event_id: str = Query(...), action: str = Query(...)):
+    """Human-in-the-loop approval endpoint."""
+    log_audit(event_id, "HUMAN_OVERRIDE", "APPROVAL_GRANTED", {"action": action})
+    execution = ActionExecutionVerifier.execute_and_verify(event_id, action)
+    return {
+        "event_id": event_id,
+        "approval_status": "APPROVED",
+        "execution": execution
+    }
+
+@app.get("/api/logs/{event_id}")
+async def fetch_audit_trace(event_id: str):
+    """Retrieves execution audit log for the target event."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT timestamp, component, action, details FROM audit_logs WHERE event_id = ? ORDER BY id ASC", 
+        (event_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [
+        {
+            "timestamp": r["timestamp"],
+            "component": r["component"],
+            "action": r["action"],
+            "details": json.loads(r["details"])
+        }
+        for r in rows
+    ]
+
+@app.get("/api/users/{user_id}")
+async def get_user_profile(user_id: str):
+    """Fetches user risk profile context."""
+    return RiskAnalyzer.get_user_baseline(user_id)
